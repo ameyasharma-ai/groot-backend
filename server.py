@@ -43,7 +43,7 @@ import random
 
 def get_dynamic_free_models():
     elite_fast_models = [
-        "openai/gpt-oss-120b:free"
+        "openai/gpt-oss-120b:free",
         "tencent/hy3-preview:free",
         "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
         "nousresearch/hermes-3-llama-3.1-405b:free",
