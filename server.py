@@ -95,7 +95,7 @@ def initialize_models():
         pass
 
     openai_api_key = os.environ.get("OPENROUTER_API_KEY")
-    openai_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=openai_api_key, timeout=3.0, max_retries=0)
+    openai_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=openai_api_key, timeout=1.5, max_retries=0)
     logger.info("Model initialization complete. Local PyTorch VRAM completely freed up.")
 
 @app.on_event("startup")
@@ -243,18 +243,32 @@ async def websocket_endpoint(websocket: WebSocket):
             {"role": "user", "content": user_prompt}
         ]
 
-        global current_active_model
-        await sys_log(f"CONNECTING TO {current_active_model.upper()}")
+        PRIMARY = "meta-llama/llama-3-8b-instruct:free"
+        await sys_log(f"CONNECTING TO MODELS (RACING)")
         await websocket.send_text(json.dumps({"type": "action_status", "message": f"CONNECTING TO MODEL..."}))
         
         try:
-            streamed_completion = await openai_client.chat.completions.create(
-                model=current_active_model,
-                messages=messages,
-                stream=True
+            async def call_model(model):
+                return await openai_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True
+                )
+
+            primary_task = asyncio.create_task(call_model(PRIMARY))
+            fallback_task = asyncio.create_task(call_model("openrouter/free"))
+
+            done, pending = await asyncio.wait(
+                [primary_task, fallback_task],
+                return_when=asyncio.FIRST_COMPLETED
             )
+
+            for task in pending:
+                task.cancel()
+
+            streamed_completion = list(done)[0].result()
         except Exception as e:
-            await sys_log(f"Model {current_active_model} returned error. Trying backups...")
+            await sys_log(f"Racing models returned error. Trying backups...")
             await websocket.send_text(json.dumps({"type": "action_status", "message": f"RATE LIMIT HIT. REROUTING..."}))
             backup_models = await asyncio.to_thread(get_dynamic_free_models)
             
