@@ -1,10 +1,10 @@
-fastapi==0.103.2
-uvicorn==0.23.2
-websockets==11.0.3
-httpx==0.24.1
-openai==1.30.0
-python-multipart==0.0.6
-python-dotenv==1.0.1
+fastapi>=0.103.2
+uvicorn>=0.23.2
+websockets>=11.0.3
+httpx>=0.27.0
+openai>=1.30.0
+python-multipart>=0.0.6
+python-dotenv>=1.0.1
 scikit-learn
 wikipedia
 edge-tts
