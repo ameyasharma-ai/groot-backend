@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import re
 import httpx
-
+import edge_tts
 warnings.filterwarnings("ignore", message=".*pkg_resources is deprecated.*")
 
 from openai import AsyncOpenAI
@@ -160,34 +160,30 @@ def add_to_knowledge_base(text, document_path="knowledge_base.txt"):
 
 conversation_history = []
 
-ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
-
-def generate_audio_b64(sentence):
+async def generate_audio_b64(sentence):
     global current_voice_id
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{current_voice_id}?output_format=mp3_44100_128"
-    headers = {
-        "Accept": "audio/mpeg",
-        "Content-Type": "application/json",
-        "xi-api-key": ELEVENLABS_API_KEY
-    }
-    data = {
-        "text": sentence,
-        "model_id": "eleven_multilingual_v2",
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.5
-        }
-    }
     
+    # Map frontend Voice IDs to Microsoft Edge Neural voices
+    voice = 'en-US-AriaNeural' # Default
+    if current_voice_id == 'EXAVITQu4vr4xnSDxMaL': # LISA
+        voice = 'en-GB-SoniaNeural' # British female
+    elif current_voice_id == 'N2lVS1w4EtoT3dr4eOWO': # ATLAS
+        voice = 'en-US-GuyNeural' # Deep confident male
+    elif current_voice_id == 'pNInz6obpgDQGcFmaJgB': # NOVA
+        voice = 'en-US-SteffanNeural' # Assertive male
+        
     try:
-        response = httpx.post(url, json=data, headers=headers, timeout=20.0)
-        if response.status_code == 200:
-            return base64.b64encode(response.content).decode('utf-8')
-        else:
-            logger.error(f"ElevenLabs TTS Error: {response.text}")
-            return None
+        communicate = edge_tts.Communicate(sentence, voice)
+        audio_data = b""
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                audio_data += chunk["data"]
+                
+        if audio_data:
+            return base64.b64encode(audio_data).decode('utf-8')
+        return None
     except Exception as e:
-        logger.error(f"ElevenLabs API Request Failed: {e}")
+        logger.error(f"Edge TTS API Request Failed: {e}")
         return None
 
 current_system_message = (
@@ -284,7 +280,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 error_msg = "All free models are currently offline or rate-limited. Check guidelines.txt for local LM Studio setup."
                 await sys_log(f"SYSTEM ERROR: {error_msg}")
                 await websocket.send_text(json.dumps({"type": "action_status", "message": "FATAL ERROR"}))
-                audio_b64 = await asyncio.to_thread(generate_audio_b64, error_msg)
+                audio_b64 = await generate_audio_b64(error_msg)
                 await websocket.send_text(json.dumps({"type": "bot_audio", "text": error_msg, "audio": audio_b64}))
                 await websocket.send_text(json.dumps({"type": "generation_done"}))
                 return
@@ -310,7 +306,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     if len(sentence) > 1:
                         if interrupt_event.is_set(): break
                         await websocket.send_text(json.dumps({"type": "action_status", "message": "SYNTHESIZING AUDIO..."}))
-                        audio_b64 = await asyncio.to_thread(generate_audio_b64, sentence)
+                        audio_b64 = await generate_audio_b64(sentence)
                         if interrupt_event.is_set(): break
                         await websocket.send_text(json.dumps({"type": "bot_audio", "text": sentence, "audio": audio_b64}))
                         await websocket.send_text(json.dumps({"type": "action_status", "message": "GENERATING..."}))
@@ -319,7 +315,7 @@ async def websocket_endpoint(websocket: WebSocket):
         if sentence_buffer.strip() and not interrupt_event.is_set():
             sentence = sentence_buffer.strip()
             await websocket.send_text(json.dumps({"type": "action_status", "message": "SYNTHESIZING AUDIO..."}))
-            audio_b64 = await asyncio.to_thread(generate_audio_b64, sentence)
+            audio_b64 = await generate_audio_b64(sentence)
             if not interrupt_event.is_set():
                 await websocket.send_text(json.dumps({"type": "bot_audio", "text": sentence, "audio": audio_b64}))
             
