@@ -43,13 +43,15 @@ import random
 
 def get_dynamic_free_models():
     elite_fast_models = [
-        "openai/gpt-oss-120b:free",
+        "meta-llama/llama-3-8b-instruct:free",
+        "mistralai/mistral-7b-instruct:free",
         "tencent/hy3-preview:free",
         "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
-        "nousresearch/hermes-3-llama-3.1-405b:free",
         "liquid/lfm-2.5-1.2b-instruct:free",
         "qwen/qwen3-coder:free",
-        "nvidia/nemotron-nano-9b-v2:free"
+        "nvidia/nemotron-nano-9b-v2:free",
+        "nousresearch/hermes-3-llama-3.1-405b:free",
+        "openai/gpt-oss-120b:free"
     ]
     try:
         response = httpx.get("https://openrouter.ai/api/v1/models", timeout=10.0)
@@ -60,7 +62,7 @@ def get_dynamic_free_models():
                 pricing = model.get("pricing", {})
                 if pricing.get("prompt") == "0" and pricing.get("completion") == "0":
                     model_id = model["id"].lower()
-                    if not any(bad in model_id for bad in ["e2b", "e4b", "experimental", "27b", "12b", "4b", "31b", "26b"]):
+                    if "experimental" not in model_id:
                         free_models.append(model["id"])
             
             preferred = [m for m in free_models if any(p in m.lower() for p in ["llama-3", "mistral", "gemma"]) and m not in elite_fast_models]
@@ -96,7 +98,7 @@ def initialize_models():
         pass
 
     openai_api_key = os.environ.get("OPENROUTER_API_KEY")
-    openai_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=openai_api_key, timeout=3.0, max_retries=0)
+    openai_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=openai_api_key, timeout=1.5, max_retries=0)
     logger.info("Model initialization complete. Local PyTorch VRAM completely freed up.")
 
 @app.on_event("startup")
@@ -159,7 +161,7 @@ def add_to_knowledge_base(text, document_path="knowledge_base.txt"):
     with open(document_path, 'a', encoding='utf-8') as file:
         file.write("\n" + text)
 
-conversation_history = []
+# conversation_history is now per-connection
 
 async def generate_audio_b64(sentence):
     global current_voice_id
@@ -194,7 +196,9 @@ current_system_message = (
 @app.websocket("/ws/chat")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    global conversation_history, current_voice_id, current_system_message
+    global current_voice_id, current_system_message
+    
+    conversation_history = []
     
     document_path = "knowledge_base.txt"
     interrupt_event = asyncio.Event()
@@ -249,18 +253,48 @@ async def websocket_endpoint(websocket: WebSocket):
         await websocket.send_text(json.dumps({"type": "action_status", "message": f"CONNECTING TO MODEL..."}))
         
         try:
-            streamed_completion = await openai_client.chat.completions.create(
-                model=current_active_model,
-                messages=messages,
-                stream=True
+            SECONDARY_MODEL = "mistralai/mistral-7b-instruct:free"
+            
+            async def call_model(model):
+                return await openai_client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    stream=True
+                )
+            
+            primary_task = asyncio.create_task(call_model(current_active_model))
+            secondary_task = asyncio.create_task(call_model(SECONDARY_MODEL))
+            
+            done, pending = await asyncio.wait(
+                [primary_task, secondary_task],
+                return_when=asyncio.FIRST_COMPLETED
             )
+            
+            streamed_completion = None
+            
+            for task in done:
+                try:
+                    streamed_completion = task.result()
+                    break
+                except:
+                    continue
+            
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except:
+                    pass
+                    
+            if not streamed_completion:
+                raise Exception("Both models failed")
         except Exception as e:
             await sys_log(f"Model {current_active_model} returned error. Trying backups...")
             await websocket.send_text(json.dumps({"type": "action_status", "message": f"RATE LIMIT HIT. REROUTING..."}))
             backup_models = await asyncio.to_thread(get_dynamic_free_models)
             
             success = False
-            for backup_model in backup_models[:15]: # Try up to 15 models
+            for backup_model in backup_models[:5]: # Try up to 5 models
                 if backup_model == current_active_model: continue
                 await sys_log(f"Trying backup model: {backup_model}")
                 try:
