@@ -142,18 +142,42 @@ def process_audio_blob(audio_data: bytes) -> str:
 
 def search_online(query):
     try:
-        return wikipedia.summary(query, sentences=50)
-    except Exception:
-        return "An error occurred while searching online."
+        try:
+            return wikipedia.summary(query, sentences=10)
+        except wikipedia.exceptions.DisambiguationError as e:
+            if e.options:
+                return wikipedia.summary(e.options[0], sentences=10)
+            raise e
+        except wikipedia.exceptions.PageError:
+            search_results = wikipedia.search(query)
+            if search_results:
+                return wikipedia.summary(search_results[0], sentences=10)
+            return f"Could not find any Wikipedia information for: {query}"
+    except Exception as e:
+        logger.error(f"Wikipedia search error for {query}: {e}")
+        return f"An error occurred while searching online for {query}."
 
 def retrieve_relevant_data(user_input, document_content):
     if not document_content.strip(): return ""
-    chunks = [document_content[i:i + 500] for i in range(0, len(document_content), 500)]
-    vectorizer = TfidfVectorizer(stop_words="english")
-    knowledge_vectors = vectorizer.fit_transform(chunks)
-    user_vector = vectorizer.transform([user_input])
-    similarities = cosine_similarity(user_vector, knowledge_vectors)
-    return chunks[similarities.argmax()]
+    
+    # Split by newlines so each remembered fact/paragraph is its own semantic chunk
+    chunks = [c.strip() for c in document_content.split('\n') if len(c.strip()) > 5]
+    if not chunks: return ""
+    
+    try:
+        vectorizer = TfidfVectorizer(stop_words="english")
+        knowledge_vectors = vectorizer.fit_transform(chunks)
+        user_vector = vectorizer.transform([user_input])
+        similarities = cosine_similarity(user_vector, knowledge_vectors)[0]
+        
+        # Only inject context if it is actually relevant (threshold > 0.1)
+        # to prevent random facts from appearing when user just says "Hi"
+        top_indices = similarities.argsort()[-2:][::-1]
+        relevant_chunks = [chunks[i] for i in top_indices if similarities[i] > 0.1]
+        
+        return "\n".join(relevant_chunks) if relevant_chunks else ""
+    except ValueError:
+        return ""
 
 def add_to_knowledge_base(text, document_path="knowledge_base.txt"):
     with open(document_path, 'a', encoding='utf-8') as file:
@@ -258,8 +282,8 @@ async def websocket_endpoint(websocket: WebSocket):
             if query:
                 await sys_log(f"ACTION: Searching Wikipedia -> {query}")
                 search_results = await asyncio.to_thread(search_online, query)
-                await asyncio.to_thread(add_to_knowledge_base, search_results, document_path)
-                document_content += "\n" + search_results
+                # We intentionally DO NOT save wikipedia results to the permanent knowledge base file
+                # so it doesn't bloat. It is used once for this answer and retained in chat history.
                 override_retrieved_data = search_results
 
         if override_retrieved_data:
@@ -269,7 +293,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
         user_prompt = user_text
         if retrieved_data:
-            user_prompt += f"\n\n[Knowledge Base Context]:\n{retrieved_data}"
+            if override_retrieved_data:
+                user_prompt += f"\n\n[System Note: The user asked to search or remember. You have successfully executed this command in the background. Read the following retrieved data and use it to directly answer the user's request:]\n\n{retrieved_data}"
+            else:
+                user_prompt += f"\n\n[Knowledge Base Context]:\n{retrieved_data}"
 
         dynamic_sys_msg = current_system_message + f" Current System Time: {time.strftime('%Y-%m-%d %H:%M:%S')}."
         
