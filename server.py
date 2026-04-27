@@ -237,17 +237,30 @@ async def websocket_endpoint(websocket: WebSocket):
             document_content = file.read()
 
         override_retrieved_data = None
-        if user_text.lower().startswith("remember"):
-            remember_text = user_text[8:].strip()
-            await asyncio.to_thread(add_to_knowledge_base, remember_text, document_path)
-            document_content += "\n" + remember_text
+        
+        # Robustly parse commands by stripping greetings, names, and polite filler
+        clean_cmd = user_text.lower().strip()
+        clean_cmd = re.sub(r'^(hey|hi|hello)\s+', '', clean_cmd)
+        clean_cmd = re.sub(r'^(lisa|atlas|nova)\s*[,.!?]?\s*', '', clean_cmd)
+        clean_cmd = re.sub(r'^(can|could)\s+you\s+(please\s+)?', '', clean_cmd)
+        clean_cmd = re.sub(r'^please\s+', '', clean_cmd)
 
-        elif user_text.lower().startswith("search for"):
-            query = user_text[11:].strip()
-            search_results = await asyncio.to_thread(search_online, query)
-            await asyncio.to_thread(add_to_knowledge_base, search_results, document_path)
-            document_content += "\n" + search_results
-            override_retrieved_data = search_results
+        if clean_cmd.startswith("remember"):
+            remember_text = re.sub(r'^remember\b\s*(that\s+)?', '', clean_cmd).strip()
+            if remember_text:
+                await sys_log(f"ACTION: Saving memory -> {remember_text}")
+                await asyncio.to_thread(add_to_knowledge_base, remember_text, document_path)
+                document_content += "\n" + remember_text
+
+        elif clean_cmd.startswith("search"):
+            query = re.sub(r'^search\b\s*(online\s*)?(for\s+|about\s+)?', '', clean_cmd).strip()
+            query = re.sub(r'[?.!]+$', '', query).strip()
+            if query:
+                await sys_log(f"ACTION: Searching Wikipedia -> {query}")
+                search_results = await asyncio.to_thread(search_online, query)
+                await asyncio.to_thread(add_to_knowledge_base, search_results, document_path)
+                document_content += "\n" + search_results
+                override_retrieved_data = search_results
 
         if override_retrieved_data:
             retrieved_data = override_retrieved_data
