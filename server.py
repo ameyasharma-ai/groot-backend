@@ -173,8 +173,28 @@ async def generate_audio_b64(sentence):
     elif current_voice_id == 'pNInz6obpgDQGcFmaJgB': # NOVA
         voice = 'en-US-SteffanNeural' # Assertive male
         
+    # Clean text to prevent TTS from reading out emojis, emoticons, and actions
+    clean_sentence = sentence
+    clean_sentence = re.sub(r'\*.*?\*', '', clean_sentence) # Remove *actions*
+    
+    emoticons = [':)', ':(', ':-)', ':-(', ';)', ';-)', ':D', ':-D', ':P', ':-P', 'xD', 'XD', '<3']
+    for e in emoticons:
+        clean_sentence = clean_sentence.replace(e, '')
+        
+    # Remove emojis
+    clean_sentence = re.sub(r'[\U00010000-\U0010ffff]', '', clean_sentence)
+    clean_sentence = re.sub(r'[\u2600-\u27BF]', '', clean_sentence)
+    
+    # Remove unwanted standalone punctuations
+    for char in ['~', '`', '*', '#']:
+        clean_sentence = clean_sentence.replace(char, '')
+        
+    clean_sentence = clean_sentence.strip()
+    if not clean_sentence:
+        return None
+
     try:
-        communicate = edge_tts.Communicate(sentence, voice)
+        communicate = edge_tts.Communicate(clean_sentence, voice)
         audio_data = b""
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
