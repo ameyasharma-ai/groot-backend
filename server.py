@@ -195,7 +195,7 @@ async def generate_audio_b64(sentence):
     elif current_voice_id == 'N2lVS1w4EtoT3dr4eOWO': # NEO (Keanu style)
         voice = 'en-US-GuyNeural' # Deep stoic male
     elif current_voice_id == 'pNInz6obpgDQGcFmaJgB': # TRINITY
-        voice = 'en-US-SteffanNeural' # Assertive female/male blend
+        voice = 'en-US-AvaNeural' # Sharp female voice
         
     # Clean text to prevent TTS from reading out emojis, emoticons, and actions
     clean_sentence = sentence
