@@ -191,11 +191,11 @@ async def generate_audio_b64(sentence):
     # Map frontend Voice IDs to Microsoft Edge Neural voices
     voice = 'en-US-AriaNeural' # Default
     if current_voice_id == 'EXAVITQu4vr4xnSDxMaL': # LISA
-        voice = 'en-GB-SoniaNeural' # British female
-    elif current_voice_id == 'N2lVS1w4EtoT3dr4eOWO': # ATLAS
-        voice = 'en-US-GuyNeural' # Deep confident male
-    elif current_voice_id == 'pNInz6obpgDQGcFmaJgB': # NOVA
-        voice = 'en-US-SteffanNeural' # Assertive male
+        voice = 'en-US-EmmaNeural' # Sweet, cheerful conversation voice
+    elif current_voice_id == 'N2lVS1w4EtoT3dr4eOWO': # NEO (Keanu style)
+        voice = 'en-US-GuyNeural' # Deep stoic male
+    elif current_voice_id == 'pNInz6obpgDQGcFmaJgB': # TRINITY
+        voice = 'en-US-SteffanNeural' # Assertive female/male blend
         
     # Clean text to prevent TTS from reading out emojis, emoticons, and actions
     clean_sentence = sentence
