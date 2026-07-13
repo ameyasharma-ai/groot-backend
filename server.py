@@ -34,10 +34,12 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
 openai_client = None
+gemini_client = None
 
 # Default to Bella (Lisa)
 current_voice_id = "EXAVITQu4vr4xnSDxMaL"
 current_active_model = "tencent/hy3-preview:free"
+current_gemini_model = "gemini-flash-lite-latest"
 
 import random
 
@@ -83,21 +85,36 @@ app.add_middleware(
 )
 
 def initialize_models():
-    global openai_client, current_active_model
+    global openai_client, gemini_client, current_active_model
     
     logger.info("Initializing models globally...")
+    
+    # Initialize Gemini client (primary - free tier)
+    gemini_api_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_api_key:
+        gemini_client = AsyncOpenAI(
+            base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
+            api_key=gemini_api_key,
+            timeout=10.0,
+            max_retries=0
+        )
+        logger.info(f"Gemini client initialized (primary model: {current_gemini_model})")
+    else:
+        logger.warning("GEMINI_API_KEY not set — Gemini disabled, using OpenRouter only.")
+    
+    # Initialize OpenRouter client (fallback)
     logger.info("Pre-fetching dynamic free models to ensure fast first connection...")
     try:
         models = get_dynamic_free_models()
         if models:
             current_active_model = models[0]
-            logger.info(f"Startup model selected: {current_active_model}")
+            logger.info(f"OpenRouter startup model selected: {current_active_model}")
     except Exception as e:
         pass
 
     openai_api_key = os.environ.get("OPENROUTER_API_KEY")
     openai_client = AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=openai_api_key, timeout=3.0, max_retries=0)
-    logger.info("Model initialization complete. Local PyTorch VRAM completely freed up.")
+    logger.info("Model initialization complete.")
 
 @app.on_event("startup")
 def startup_event():
@@ -305,46 +322,65 @@ async def websocket_endpoint(websocket: WebSocket):
         ]
 
         global current_active_model
-        await sys_log(f"CONNECTING TO {current_active_model.upper()}")
-        await websocket.send_text(json.dumps({"type": "action_status", "message": f"CONNECTING TO MODEL..."}))
         
-        try:
-            streamed_completion = await openai_client.chat.completions.create(
-                model=current_active_model,
-                messages=messages,
-                stream=True
-            )
-        except Exception as e:
-            await sys_log(f"Model {current_active_model} returned error. Trying backups...")
-            await websocket.send_text(json.dumps({"type": "action_status", "message": f"RATE LIMIT HIT. REROUTING..."}))
-            backup_models = await asyncio.to_thread(get_dynamic_free_models)
-            
-            success = False
-            for backup_model in backup_models[:15]: # Try up to 15 models
-                if backup_model == current_active_model: continue
-                await sys_log(f"Trying backup model: {backup_model}")
-                try:
-                    streamed_completion = await openai_client.chat.completions.create(
-                        model=backup_model,
-                        messages=messages,
-                        stream=True
-                    )
-                    current_active_model = backup_model
-                    await sys_log(f"Successfully connected to {backup_model}")
-                    success = True
-                    break
-                except Exception as e2:
-                    await sys_log(f"{backup_model} failed: {str(e2)[:50]}")
-                    continue
-            
-            if not success:
-                error_msg = "All free models are currently offline or rate-limited. Check guidelines.txt for local LM Studio setup."
-                await sys_log(f"SYSTEM ERROR: {error_msg}")
-                await websocket.send_text(json.dumps({"type": "action_status", "message": "FATAL ERROR"}))
-                audio_b64 = await generate_audio_b64(error_msg)
-                await websocket.send_text(json.dumps({"type": "bot_audio", "text": error_msg, "audio": audio_b64}))
-                await websocket.send_text(json.dumps({"type": "generation_done"}))
-                return
+        streamed_completion = None
+        
+        # === PRIMARY: Try Gemini first ===
+        if gemini_client:
+            await sys_log(f"CONNECTING TO GEMINI ({current_gemini_model.upper()})")
+            await websocket.send_text(json.dumps({"type": "action_status", "message": f"CONNECTING TO GEMINI..."}))
+            try:
+                streamed_completion = await gemini_client.chat.completions.create(
+                    model=current_gemini_model,
+                    messages=messages,
+                    stream=True
+                )
+                await sys_log(f"Gemini connected successfully.")
+            except Exception as gemini_err:
+                await sys_log(f"Gemini failed: {str(gemini_err)[:80]}. Falling back to OpenRouter...")
+                streamed_completion = None
+        
+        # === FALLBACK: OpenRouter ===
+        if streamed_completion is None:
+            await sys_log(f"CONNECTING TO {current_active_model.upper()}")
+            await websocket.send_text(json.dumps({"type": "action_status", "message": f"CONNECTING TO OPENROUTER..."}))
+            try:
+                streamed_completion = await openai_client.chat.completions.create(
+                    model=current_active_model,
+                    messages=messages,
+                    stream=True
+                )
+            except Exception as e:
+                await sys_log(f"Model {current_active_model} returned error. Trying backups...")
+                await websocket.send_text(json.dumps({"type": "action_status", "message": f"RATE LIMIT HIT. REROUTING..."}))
+                backup_models = await asyncio.to_thread(get_dynamic_free_models)
+                
+                success = False
+                for backup_model in backup_models[:15]: # Try up to 15 models
+                    if backup_model == current_active_model: continue
+                    await sys_log(f"Trying backup model: {backup_model}")
+                    try:
+                        streamed_completion = await openai_client.chat.completions.create(
+                            model=backup_model,
+                            messages=messages,
+                            stream=True
+                        )
+                        current_active_model = backup_model
+                        await sys_log(f"Successfully connected to {backup_model}")
+                        success = True
+                        break
+                    except Exception as e2:
+                        await sys_log(f"{backup_model} failed: {str(e2)[:50]}")
+                        continue
+                
+                if not success:
+                    error_msg = "All models are currently offline or rate-limited. Please try again later."
+                    await sys_log(f"SYSTEM ERROR: {error_msg}")
+                    await websocket.send_text(json.dumps({"type": "action_status", "message": "FATAL ERROR"}))
+                    audio_b64 = await generate_audio_b64(error_msg)
+                    await websocket.send_text(json.dumps({"type": "bot_audio", "text": error_msg, "audio": audio_b64}))
+                    await websocket.send_text(json.dumps({"type": "generation_done"}))
+                    return
 
         await websocket.send_text(json.dumps({"type": "action_status", "message": "GENERATING..."}))
         response = ""
@@ -423,6 +459,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         if payload.get("system_prompt"):
                             current_system_message = payload.get("system_prompt")
                         logger.info(f"Theme and Voice switched. New Voice ID: {current_voice_id}")
+                        continue
+                    if payload.get("type") == "set_model":
+                        current_gemini_model = payload.get("gemini_model", current_gemini_model)
+                        logger.info(f"Model switched. Gemini: {current_gemini_model}")
                         continue
                 except:
                     pass
