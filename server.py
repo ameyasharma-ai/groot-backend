@@ -1,11 +1,11 @@
 import os
 import time
 import logging
-import tempfile
 import asyncio
 import warnings
 import json
 import base64
+import io
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -126,24 +126,18 @@ def clean_transcription(transcription):
     return transcription
 
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+async_httpx_client = httpx.AsyncClient(timeout=15.0)
 
-def process_audio_blob(audio_data: bytes) -> str:
+async def process_audio_blob(audio_data: bytes) -> str:
     start_time = time.time()
     logger.info("Transcribing via Groq Whisper API (whisper-large-v3-turbo)...")
-    fd, path = tempfile.mkstemp(suffix=".webm")
     try:
-        with os.fdopen(fd, 'wb') as f:
-            f.write(audio_data)
-            
-        with open(path, "rb") as f:
-            response = httpx.post(
-                "https://api.groq.com/openai/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-                data={"model": "whisper-large-v3-turbo", "language": "en"},
-                files={"file": ("audio.webm", f, "audio/webm")},
-                timeout=15.0
-            )
-            
+        response = await async_httpx_client.post(
+            "https://api.groq.com/openai/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            data={"model": "whisper-large-v3-turbo", "language": "en"},
+            files={"file": ("audio.webm", io.BytesIO(audio_data), "audio/webm")},
+        )
         if response.status_code == 200:
             transcription = response.json().get("text", "")
             logger.info(f"Groq Transcription successful in {time.time() - start_time:.2f}s")
@@ -154,8 +148,6 @@ def process_audio_blob(audio_data: bytes) -> str:
     except Exception as e:
         logger.error(f"Transcription failed: {e}")
         return ""
-    finally:
-        os.remove(path)
 
 def search_online(query):
     try:
@@ -386,6 +378,23 @@ async def websocket_endpoint(websocket: WebSocket):
         response = ""
         sentence_buffer = ""
         
+        # Parallel TTS pipeline: fire TTS tasks while LLM keeps streaming
+        tts_queue = asyncio.Queue()
+        
+        async def tts_sender():
+            """Sends TTS results in order as they complete."""
+            while True:
+                item = await tts_queue.get()
+                if item is None:  # sentinel
+                    break
+                sentence, tts_task = item
+                audio_b64 = await tts_task
+                if interrupt_event.is_set():
+                    continue
+                await websocket.send_text(json.dumps({"type": "bot_audio", "text": sentence, "audio": audio_b64}))
+        
+        sender_task = asyncio.create_task(tts_sender())
+        
         async for chunk in streamed_completion:
             if interrupt_event.is_set():
                 break
@@ -395,26 +404,23 @@ async def websocket_endpoint(websocket: WebSocket):
                 response += content
                 sentence_buffer += content
                 
-                # if not interrupt_event.is_set():
-                #     await websocket.send_text(json.dumps({"type": "bot_text_stream", "text": content}))
-                
                 if sentence_buffer.endswith(('.', '!', '?', ',', ';', ':')):
                     sentence = sentence_buffer.strip()
                     if len(sentence) > 1:
                         if interrupt_event.is_set(): break
-                        await websocket.send_text(json.dumps({"type": "action_status", "message": "SYNTHESIZING AUDIO..."}))
-                        audio_b64 = await generate_audio_b64(sentence)
-                        if interrupt_event.is_set(): break
-                        await websocket.send_text(json.dumps({"type": "bot_audio", "text": sentence, "audio": audio_b64}))
-                        await websocket.send_text(json.dumps({"type": "action_status", "message": "GENERATING..."}))
+                        # Fire TTS in background — don't block LLM streaming
+                        tts_task = asyncio.create_task(generate_audio_b64(sentence))
+                        await tts_queue.put((sentence, tts_task))
                     sentence_buffer = ""
 
         if sentence_buffer.strip() and not interrupt_event.is_set():
             sentence = sentence_buffer.strip()
-            await websocket.send_text(json.dumps({"type": "action_status", "message": "SYNTHESIZING AUDIO..."}))
-            audio_b64 = await generate_audio_b64(sentence)
-            if not interrupt_event.is_set():
-                await websocket.send_text(json.dumps({"type": "bot_audio", "text": sentence, "audio": audio_b64}))
+            tts_task = asyncio.create_task(generate_audio_b64(sentence))
+            await tts_queue.put((sentence, tts_task))
+        
+        # Signal sender to stop, then wait for all audio to be sent
+        await tts_queue.put(None)
+        await sender_task
             
         await sys_log(f"AI REPLIED: {response}")
         await websocket.send_text(json.dumps({"type": "action_status", "message": "IDLE"}))
@@ -438,7 +444,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 await websocket.send_text(json.dumps({"type": "log", "message": "Routing audio to Groq API (whisper-large-v3-turbo)..."}))
                 
                 start_t = time.time()
-                user_text = await asyncio.to_thread(process_audio_blob, audio_bytes)
+                user_text = await process_audio_blob(audio_bytes)
                 elapsed = time.time() - start_t
                 
                 if user_text:
