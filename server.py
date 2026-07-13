@@ -255,7 +255,7 @@ current_system_message = (
 @app.websocket("/ws/chat")
 async def websocket_endpoint(websocket: WebSocket):
     await websocket.accept()
-    global conversation_history, current_voice_id, current_system_message
+    global conversation_history, current_voice_id, current_system_message, current_gemini_model
     
     document_path = "knowledge_base.txt"
     interrupt_event = asyncio.Event()
