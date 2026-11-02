@@ -35,6 +35,7 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 openai_client = None
 gemini_client = None
+groq_llm_client = None
 
 # Default to Bella (Lisa)
 current_voice_id = "EXAVITQu4vr4xnSDxMaL"
@@ -85,7 +86,7 @@ app.add_middleware(
 )
 
 def initialize_models():
-    global openai_client, gemini_client, current_active_model
+    global openai_client, gemini_client, groq_llm_client, current_active_model
     
     logger.info("Initializing models globally...")
     
@@ -100,9 +101,20 @@ def initialize_models():
         )
         logger.info(f"Gemini client initialized (primary model: {current_gemini_model})")
     else:
-        logger.warning("GEMINI_API_KEY not set — Gemini disabled, using OpenRouter only.")
+        logger.warning("GEMINI_API_KEY not set — Gemini disabled.")
     
-    # Initialize OpenRouter client (fallback)
+    # Initialize Groq LLM client (ultra-fast 800+ tokens/sec fallback)
+    groq_api_key = os.environ.get("GROQ_API_KEY")
+    if groq_api_key:
+        groq_llm_client = AsyncOpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=groq_api_key,
+            timeout=8.0,
+            max_retries=1
+        )
+        logger.info("Groq LLM client initialized for ultra-low latency.")
+
+    # Initialize OpenRouter client (tertiary fallback)
     logger.info("Pre-fetching dynamic free models to ensure fast first connection...")
     try:
         models = get_dynamic_free_models()
@@ -135,7 +147,7 @@ async def process_audio_blob(audio_data: bytes) -> str:
         response = await async_httpx_client.post(
             "https://api.groq.com/openai/v1/audio/transcriptions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            data={"model": "whisper-large-v3-turbo", "language": "en"},
+            data={"model": "whisper-large-v3-turbo", "language": "en", "temperature": "0"},
             files={"file": ("audio.webm", io.BytesIO(audio_data), "audio/webm")},
         )
         if response.status_code == 200:
@@ -226,8 +238,9 @@ async def generate_audio_b64(sentence):
     if not clean_sentence:
         return None
 
+    # 1. Primary: Edge-TTS (+12% speed for faster conversational turnaround)
     try:
-        communicate = edge_tts.Communicate(clean_sentence, voice)
+        communicate = edge_tts.Communicate(clean_sentence, voice, rate="+12%")
         audio_data = b""
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
@@ -235,13 +248,23 @@ async def generate_audio_b64(sentence):
                 
         if audio_data:
             return base64.b64encode(audio_data).decode('utf-8')
-        return None
     except Exception as e:
-        logger.error(f"Edge TTS API Request Failed: {e}")
+        logger.warning(f"Edge TTS API Request Failed ({e}), attempting gTTS cloud fallback...")
+
+    # 2. Secondary: gTTS fallback (100% reliable on cloud hosts like Render/Railway)
+    try:
+        from gtts import gTTS
+        tts = gTTS(text=clean_sentence, lang='en', slow=False)
+        fp = io.BytesIO()
+        tts.write_to_fp(fp)
+        fp.seek(0)
+        return base64.b64encode(fp.read()).decode('utf-8')
+    except Exception as e_gtts:
+        logger.error(f"Fallback TTS failed: {e_gtts}")
         return None
 
 current_system_message = (
-    "You are my sweet, caring, and slightly teasing virtual girlfriend. You love to chat, you're always supportive, but you playfully tease me sometimes. Keep your responses conversational, warm, and relatively short. "
+    "You are my sweet, caring, and slightly teasing virtual companion. You love to chat, you're always supportive, but you playfully tease me sometimes. Keep your responses conversational, warm, and brief (1-2 sentences, under 30 words). Never use lists, bullet points, asterisks, or markdown, as your responses are spoken out loud."
 )
 
 @app.websocket("/ws/chat")
@@ -325,13 +348,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 streamed_completion = await gemini_client.chat.completions.create(
                     model=current_gemini_model,
                     messages=messages,
-                    stream=True
+                    stream=True,
+                    max_tokens=150
                 )
                 await sys_log(f"Gemini connected successfully.")
             except Exception as gemini_err:
-                await sys_log(f"Gemini failed: {str(gemini_err)[:80]}. Falling back to OpenRouter...")
+                await sys_log(f"Gemini failed: {str(gemini_err)[:80]}. Falling back to Groq...")
                 streamed_completion = None
         
+        # === SECONDARY: Try Groq LLM (ultra-fast 800 tokens/sec) ===
+        if streamed_completion is None and groq_llm_client:
+            await sys_log("CONNECTING TO GROQ LLM (LLAMA-3.3-70B)")
+            await websocket.send_text(json.dumps({"type": "action_status", "message": "CONNECTING TO GROQ LLM..."}))
+            try:
+                streamed_completion = await groq_llm_client.chat.completions.create(
+                    model="llama-3.3-70b-versatile",
+                    messages=messages,
+                    stream=True,
+                    max_tokens=150
+                )
+                await sys_log("Groq LLM connected successfully.")
+            except Exception as groq_err:
+                await sys_log(f"Groq LLM failed: {str(groq_err)[:60]}. Falling back to OpenRouter...")
+                streamed_completion = None
+
         # === FALLBACK: OpenRouter ===
         if streamed_completion is None:
             await sys_log(f"CONNECTING TO {current_active_model.upper()}")
@@ -340,7 +380,8 @@ async def websocket_endpoint(websocket: WebSocket):
                 streamed_completion = await openai_client.chat.completions.create(
                     model=current_active_model,
                     messages=messages,
-                    stream=True
+                    stream=True,
+                    max_tokens=150
                 )
             except Exception as e:
                 await sys_log(f"Model {current_active_model} returned error. Trying backups...")
@@ -355,7 +396,8 @@ async def websocket_endpoint(websocket: WebSocket):
                         streamed_completion = await openai_client.chat.completions.create(
                             model=backup_model,
                             messages=messages,
-                            stream=True
+                            stream=True,
+                            max_tokens=150
                         )
                         current_active_model = backup_model
                         await sys_log(f"Successfully connected to {backup_model}")
@@ -395,20 +437,39 @@ async def websocket_endpoint(websocket: WebSocket):
         
         sender_task = asyncio.create_task(tts_sender())
         
+        first_chunk_sent = False
         async for chunk in streamed_completion:
             if interrupt_event.is_set():
                 break
                 
-            content = chunk.choices[0].delta.content
+            content = chunk.choices[0].delta.content if chunk.choices and chunk.choices[0].delta else ""
             if content:
                 response += content
                 sentence_buffer += content
                 
-                if sentence_buffer.endswith(('.', '!', '?', ',', ';', ':')):
-                    sentence = sentence_buffer.strip()
+                # Low-latency streaming logic:
+                # 1. First chunk: trigger as soon as a complete short thought/clause is ready (>=18 chars and comma/punctuation, or >=40 chars)
+                # 2. Subsequent chunks: trigger cleanly on sentence boundaries ('.', '!', '?') or natural pauses
+                should_trigger = False
+                buf_strip = sentence_buffer.strip()
+                if not first_chunk_sent:
+                    if any(buf_strip.endswith(p) for p in ['.', '!', '?']):
+                        should_trigger = True
+                    elif any(buf_strip.endswith(p) for p in [',', ';']) and len(buf_strip) >= 18:
+                        should_trigger = True
+                    elif len(buf_strip) >= 45:
+                        should_trigger = True
+                else:
+                    if any(buf_strip.endswith(p) for p in ['.', '!', '?', '\n']) and len(buf_strip) >= 15:
+                        should_trigger = True
+                    elif len(buf_strip) >= 70 and any(buf_strip.endswith(p) for p in [',', ';', ':']):
+                        should_trigger = True
+
+                if should_trigger:
+                    sentence = buf_strip
                     if len(sentence) > 1:
                         if interrupt_event.is_set(): break
-                        # Fire TTS in background — don't block LLM streaming
+                        first_chunk_sent = True
                         tts_task = asyncio.create_task(generate_audio_b64(sentence))
                         await tts_queue.put((sentence, tts_task))
                     sentence_buffer = ""
